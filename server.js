@@ -72,7 +72,17 @@ const upload = multer({
       await fsp.mkdir(dir, { recursive: true });
       cb(null, dir);
     },
-    filename: (_req, file, cb) => cb(null, file.originalname),
+    // file.originalname is attacker-controlled (multipart Content-Disposition).
+    // Never use it for the on-disk path — multer would happily path.join it
+    // with the destination, and "../../foo" escapes. Use a random opaque
+    // name on disk; the route handler still has file.originalname (unchanged
+    // by multer) for display + output-name derivation, which is then run
+    // through sanitizeName() before being used in any path.
+    filename: (_req, file, cb) => {
+      const ext = path.extname(path.basename(file.originalname || ""));
+      const safeExt = /^\.[A-Za-z0-9]{1,5}$/.test(ext) ? ext.toLowerCase() : ".pdf";
+      cb(null, crypto.randomBytes(8).toString("hex") + safeExt);
+    },
   }),
   limits: { fileSize: MAX_FILE_BYTES },
 });
