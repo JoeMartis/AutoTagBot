@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoTagBot &mdash; Batch PDF Accessibility</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>AutoTagBot</h1>
+        <p class="sub">Batch-tag PDFs, draft alt text with Claude, review, then export.</p>
+      </header>
+
+      <!-- STEP 1: submit -->
+      <section id="step-submit">
+        <form id="batch-form">
+          <section class="card">
+            <h2>1. Credentials</h2>
+            <p class="hint">Held in memory for this batch only. Never written to disk.</p>
+            <label>
+              <span>Adobe client_id</span>
+              <input type="password" name="clientId" autocomplete="off" required />
+            </label>
+            <label>
+              <span>Adobe client_secret</span>
+              <input type="password" name="clientSecret" autocomplete="off" required />
+            </label>
+            <label>
+              <span>Anthropic API key</span>
+              <input type="password" name="anthropicKey" autocomplete="off" required />
+            </label>
+          </section>
+
+          <section class="card">
+            <h2>2. Options</h2>
+            <div class="grid">
+              <label class="check">
+                <input type="checkbox" name="runAccessibilityChecker" checked />
+                Include Accessibility Checker report
+              </label>
+              <label class="check">
+                <input type="checkbox" name="generateReport" />
+                Generate XLSX tagging report
+              </label>
+              <label class="check">
+                <input type="checkbox" name="shiftHeadings" />
+                Shift headings (WCAG-friendly)
+              </label>
+            </div>
+            <div class="grid two">
+              <label>
+                <span>Checker page start (optional)</span>
+                <input type="number" name="pageStart" min="1" placeholder="1" />
+              </label>
+              <label>
+                <span>Checker page end (optional)</span>
+                <input type="number" name="pageEnd" min="1" placeholder="last" />
+              </label>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>3. Files &amp; naming</h2>
+            <label class="filedrop">
+              <input type="file" id="files" name="files" accept="application/pdf" multiple />
+              <span>Drop PDFs here or click to choose</span>
+            </label>
+
+            <label>
+              <span>Batch name pattern</span>
+              <input type="text" id="pattern" name="namePattern" value="{name}-tagged" />
+              <small class="hint"><code>{name}</code> = original filename without extension. Applied to any file you don't rename.</small>
+            </label>
+
+            <div id="file-list"></div>
+          </section>
+
+          <button id="submit-btn" type="submit">Analyze &amp; draft alt text</button>
+          <div id="status" role="status" aria-live="polite"></div>
+        </form>
+      </section>
+
+      <!-- STEP 2: review -->
+      <section id="step-review" hidden>
+        <div class="review-header card">
+          <div>
+            <h2>Review draft alt text</h2>
+            <p class="hint" id="review-summary"></p>
+          </div>
+          <div class="review-actions">
+            <button id="back-btn" type="button" class="ghost">Cancel</button>
+            <button id="finalize-btn" type="button">Export zip</button>
+          </div>
+        </div>
+        <div id="review-list"></div>
+        <div id="review-status" role="status" aria-live="polite"></div>
+      </section>
+
+      <footer>
+        <small>
+          <a href="https://developer.adobe.com/document-services/docs/overview/pdf-accessibility-auto-tag-api/" target="_blank" rel="noopener">Adobe Auto-Tag</a>
+          &middot;
+          <a href="https://developer.adobe.com/document-services/docs/overview/pdf-services-api/howtos/pdf-accessibility-checker-api/" target="_blank" rel="noopener">Accessibility Checker</a>
+          &middot;
+          <a href="https://docs.claude.com/en/docs/about-claude/models" target="_blank" rel="noopener">Claude Haiku 4.5</a>
+        </small>
+      </footer>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
