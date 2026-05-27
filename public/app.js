@@ -202,7 +202,7 @@ function collectAltText() {
 
 finalizeBtn.addEventListener("click", async () => {
   finalizeBtn.disabled = true;
-  setStatus(reviewStatus, "Building zip…");
+  setStatus(reviewStatus, "Applying alt text and re-running the accessibility checker — this can take ~10–30s per PDF…");
   try {
     const res = await fetch("/api/finalize", {
       method: "POST",

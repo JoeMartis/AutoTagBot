@@ -7,6 +7,7 @@ const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 
 const {
   ServicePrincipalCredentials,
@@ -32,6 +33,32 @@ const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 const CLAUDE_MODEL = "claude-haiku-4-5";
 const CLAUDE_CONCURRENCY = 4;
+const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
+const APPLY_ALT_SCRIPT = path.join(__dirname, "scripts", "apply_alt.py");
+
+function runPython(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(PYTHON_BIN, [APPLY_ALT_SCRIPT, ...args]);
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => (stdout += d));
+    proc.stderr.on("data", (d) => (stderr += d));
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      let parsed = null;
+      try { parsed = JSON.parse(stdout); } catch {}
+      if (code === 0) return resolve(parsed || { ok: true });
+      const err = new Error(
+        (parsed && parsed.error) ||
+          stderr.trim() ||
+          `apply_alt.py exited with code ${code}`,
+      );
+      err.code = code;
+      err.report = parsed;
+      reject(err);
+    });
+  });
+}
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -256,7 +283,16 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
   const pdfServices = new PDFServices({ credentials });
   const anthropic = new Anthropic({ apiKey: anthropicKey });
 
-  const session = { createdAt: Date.now(), workDir, options, files: [] };
+  // Credentials are held in the session so /api/finalize can re-run the
+  // checker on the rewritten PDF without asking the user to re-enter them.
+  // Same trust model as before: in-memory only, dropped when the session ends.
+  const session = {
+    createdAt: Date.now(),
+    workDir,
+    options,
+    files: [],
+    credentials: { clientId, clientSecret },
+  };
   const errors = [];
   const responseFiles = [];
 
@@ -279,20 +315,6 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
         if (options.generateReport && autoTagResult.report) {
           taggingReportPath = path.join(workDir, `${outputBase}-tagging-report.xlsx`);
           await downloadAssetToFile(pdfServices, autoTagResult.report, taggingReportPath);
-        }
-
-        let checkerPdfPath = null;
-        let checkerReportPath = null;
-        if (options.runAccessibilityChecker) {
-          const checkerResult = await runAccessibilityChecker(pdfServices, taggedPath, options);
-          if (checkerResult.asset) {
-            checkerPdfPath = path.join(workDir, `${outputBase}-accessibility.pdf`);
-            await downloadAssetToFile(pdfServices, checkerResult.asset, checkerPdfPath);
-          }
-          if (checkerResult.report) {
-            checkerReportPath = path.join(workDir, `${outputBase}-accessibility-report.json`);
-            await downloadAssetToFile(pdfServices, checkerResult.report, checkerReportPath);
-          }
         }
 
         const extractDir = path.join(workDir, `extract-${i}`);
@@ -320,8 +342,6 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           originalName: file.originalname,
           taggedPath,
           taggingReportPath,
-          checkerPdfPath,
-          checkerReportPath,
           figures: figs.map((f, idx) => ({ ...f, id: `${i}-${idx}` })),
         });
 
@@ -354,11 +374,87 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
   }
 });
 
+async function applyAltAndCheck(session, file, altById) {
+  const manifest = file.figures.map((f) => ({
+    id: f.id,
+    path: f.path,
+    page: f.page,
+    bbox: f.bbox,
+    alt: (altById[f.id] && altById[f.id].alt) || "",
+    decorative: !!(altById[f.id] && altById[f.id].decorative),
+    complex: !!(altById[f.id] && altById[f.id].complex),
+  }));
+
+  const manifestPath = path.join(session.workDir, `${file.outputBase}-alt-manifest.json`);
+  await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+
+  let rewrittenPath = null;
+  let rewriteReport = null;
+  let rewriteError = null;
+  try {
+    const candidatePath = path.join(session.workDir, `${file.outputBase}-with-alt.pdf`);
+    rewriteReport = await runPython([
+      "--in", file.taggedPath,
+      "--out", candidatePath,
+      "--manifest", manifestPath,
+    ]);
+    rewrittenPath = candidatePath;
+  } catch (err) {
+    rewriteError = err.message || String(err);
+  }
+
+  let checkerPdfPath = null;
+  let checkerReportPath = null;
+  let checkerError = null;
+  if (session.options.runAccessibilityChecker) {
+    try {
+      const credentials = new ServicePrincipalCredentials(session.credentials);
+      const pdfServices = new PDFServices({ credentials });
+      const checkerResult = await runAccessibilityChecker(
+        pdfServices,
+        rewrittenPath || file.taggedPath,
+        session.options,
+      );
+      if (checkerResult.asset) {
+        checkerPdfPath = path.join(session.workDir, `${file.outputBase}-accessibility.pdf`);
+        await downloadAssetToFile(pdfServices, checkerResult.asset, checkerPdfPath);
+      }
+      if (checkerResult.report) {
+        checkerReportPath = path.join(session.workDir, `${file.outputBase}-accessibility-report.json`);
+        await downloadAssetToFile(pdfServices, checkerResult.report, checkerReportPath);
+      }
+    } catch (err) {
+      checkerError = err.message || String(err);
+    }
+  }
+
+  return { manifest, rewrittenPath, rewriteReport, rewriteError, checkerPdfPath, checkerReportPath, checkerError };
+}
+
 app.post("/api/finalize", async (req, res) => {
   const { sessionId, altText } = req.body || {};
   if (!sessionId || !sessions.has(sessionId)) return res.status(404).json({ error: "Session not found or expired." });
   const session = sessions.get(sessionId);
   const altById = altText || {};
+
+  // Process each file before opening the zip so a fatal apply_alt failure
+  // (e.g. pikepdf missing) returns a clean JSON error instead of a broken stream.
+  const perFile = [];
+  for (const file of session.files) {
+    const result = await applyAltAndCheck(session, file, altById);
+    perFile.push({ file, ...result });
+  }
+
+  // If every file failed the rewrite, return a 500 with the first error so the
+  // user sees the underlying cause instead of a zip with no PDFs in it.
+  if (perFile.every((p) => p.rewriteError)) {
+    const first = perFile.find((p) => p.rewriteError);
+    return res.status(500).json({
+      error: "Alt-text write-back failed for every file.",
+      detail: first ? first.rewriteError : null,
+      hint: "Ensure Python 3 and pikepdf are installed on the server: pip install pikepdf",
+    });
+  }
 
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", `attachment; filename="autotagbot-batch.zip"`);
@@ -370,27 +466,22 @@ app.post("/api/finalize", async (req, res) => {
   archive.pipe(res);
 
   try {
-    for (const file of session.files) {
-      archive.file(file.taggedPath, { name: `${file.outputBase}.pdf` });
+    for (const p of perFile) {
+      const { file, manifest, rewrittenPath, rewriteReport, rewriteError, checkerPdfPath, checkerReportPath, checkerError } = p;
+
+      // Prefer the alt-applied PDF; fall back to the bare tagged PDF if rewrite failed for this file.
+      const pdfPath = rewrittenPath || file.taggedPath;
+      archive.file(pdfPath, { name: `${file.outputBase}.pdf` });
+
       if (file.taggingReportPath) {
         archive.file(file.taggingReportPath, { name: `${file.outputBase}-tagging-report.xlsx` });
       }
-      if (file.checkerPdfPath) {
-        archive.file(file.checkerPdfPath, { name: `${file.outputBase}-accessibility.pdf` });
+      if (checkerPdfPath) {
+        archive.file(checkerPdfPath, { name: `${file.outputBase}-accessibility.pdf` });
       }
-      if (file.checkerReportPath) {
-        archive.file(file.checkerReportPath, { name: `${file.outputBase}-accessibility-report.json` });
+      if (checkerReportPath) {
+        archive.file(checkerReportPath, { name: `${file.outputBase}-accessibility-report.json` });
       }
-
-      const manifest = file.figures.map((f) => ({
-        id: f.id,
-        path: f.path,
-        page: f.page,
-        bbox: f.bbox,
-        alt: (altById[f.id] && altById[f.id].alt) || "",
-        decorative: !!(altById[f.id] && altById[f.id].decorative),
-        complex: !!(altById[f.id] && altById[f.id].complex),
-      }));
 
       archive.append(JSON.stringify(manifest, null, 2), { name: `${file.outputBase}-alt-text.json` });
 
@@ -398,17 +489,30 @@ app.post("/api/finalize", async (req, res) => {
       const csvBody = manifest
         .map((m) => {
           const alt = (m.alt || "").replace(/"/g, '""');
-          const p = (m.path || "").replace(/"/g, '""');
-          return `${m.id},"${p}",${m.page ?? ""},${m.decorative},${m.complex},"${alt}"`;
+          const pp = (m.path || "").replace(/"/g, '""');
+          return `${m.id},"${pp}",${m.page ?? ""},${m.decorative},${m.complex},"${alt}"`;
         })
         .join("\n");
       archive.append(csvHeader + csvBody + "\n", { name: `${file.outputBase}-alt-text.csv` });
+
+      if (rewriteReport || rewriteError || checkerError) {
+        archive.append(
+          JSON.stringify(
+            { rewrite: rewriteReport || null, rewriteError, checkerError },
+            null,
+            2,
+          ),
+          { name: `${file.outputBase}-process-report.json` },
+        );
+      }
     }
 
     await archive.finalize();
   } catch (err) {
     console.error(err);
   } finally {
+    // Drop credentials and clean up.
+    session.credentials = null;
     fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
     sessions.delete(sessionId);
   }
