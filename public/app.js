@@ -4,6 +4,20 @@ const form = document.getElementById("batch-form");
 const submitBtn = document.getElementById("submit-btn");
 const statusEl = document.getElementById("status");
 const patternInput = document.getElementById("pattern");
+const draftAltToggle = document.getElementById("draft-alt-toggle");
+const anthropicKeyLabel = document.getElementById("anthropic-key-label");
+const anthropicKeyInput = anthropicKeyLabel.querySelector("input");
+
+function syncDraftAlt() {
+  const on = draftAltToggle.checked;
+  anthropicKeyLabel.hidden = !on;
+  anthropicKeyInput.required = on;
+  anthropicKeyInput.setAttribute("aria-required", on ? "true" : "false");
+  if (!on) anthropicKeyInput.value = "";
+  submitBtn.textContent = on ? "Analyze & draft alt text" : "Analyze (no drafts)";
+}
+draftAltToggle.addEventListener("change", syncDraftAlt);
+syncDraftAlt();
 
 const stepSubmit = document.getElementById("step-submit");
 const stepReview = document.getElementById("step-review");
@@ -74,10 +88,25 @@ form.addEventListener("submit", async (e) => {
     return;
   }
 
+  const clientId = form.elements.clientId.value.trim();
+  const clientSecret = form.elements.clientSecret.value.trim();
+  const draftAlt = draftAltToggle.checked;
+  const anthropicKey = draftAlt ? form.elements.anthropicKey.value.trim() : "";
+
+  if (!clientId || !clientSecret) {
+    setStatus(statusEl, "Adobe credentials are required.", "err");
+    return;
+  }
+  if (draftAlt && !anthropicKey) {
+    setStatus(statusEl, "Anthropic API key is required when 'Draft alt text with Claude' is on.", "err");
+    return;
+  }
+
   const fd = new FormData();
-  fd.append("clientId", form.elements.clientId.value.trim());
-  fd.append("clientSecret", form.elements.clientSecret.value.trim());
-  fd.append("anthropicKey", form.elements.anthropicKey.value.trim());
+  fd.append("clientId", clientId);
+  fd.append("clientSecret", clientSecret);
+  fd.append("anthropicKey", anthropicKey);
+  fd.append("draftAlt", draftAlt);
   fd.append("namePattern", patternInput.value || "{name}-tagged");
   fd.append("runAccessibilityChecker", form.elements.runAccessibilityChecker.checked);
   fd.append("generateReport", form.elements.generateReport.checked);
@@ -88,12 +117,20 @@ form.addEventListener("submit", async (e) => {
   for (const f of selectedFiles) fd.append("files", f.file, f.file.name);
 
   submitBtn.disabled = true;
-  setStatus(statusEl, `Tagging ${selectedFiles.length} PDF(s) and drafting alt text — this typically runs ~30–60s per file.`);
+  submitBtn.setAttribute("aria-busy", "true");
+  const baseMsg = draftAlt
+    ? `Tagging ${selectedFiles.length} PDF(s) and drafting alt text — this typically runs ~30–60s per file.`
+    : `Tagging ${selectedFiles.length} PDF(s) — this typically runs ~15–30s per file.`;
+  setStatus(statusEl, baseMsg);
 
   try {
     const res = await fetch("/api/analyze", { method: "POST", body: fd });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) {
+      const detail = data.error || `HTTP ${res.status}`;
+      const errList = (data.errors || []).map((e) => `${e.file}${e.stage ? ` [${e.stage}]` : ""}: ${e.message}`).join("\n");
+      throw new Error(errList ? `${detail}\n${errList}` : detail);
+    }
     session = data;
     showReview();
   } catch (err) {
@@ -104,6 +141,7 @@ form.addEventListener("submit", async (e) => {
     form.elements.clientSecret.value = "";
     form.elements.anthropicKey.value = "";
     submitBtn.disabled = false;
+    submitBtn.removeAttribute("aria-busy");
   }
 });
 
@@ -122,7 +160,18 @@ function showReview() {
   reviewList.innerHTML = "";
 
   const totalFigs = session.files.reduce((n, f) => n + f.figures.length, 0);
-  reviewSummary.textContent = `${session.files.length} PDF(s), ${totalFigs} figure(s). Edit drafts below; blank alt text is allowed for decorative images.`;
+  reviewSummary.textContent = `${session.files.length} PDF(s), ${totalFigs} figure(s). Edit alt text below; mark images as decorative to leave alt blank.`;
+
+  // Surface analyze-stage errors (files that failed entirely)
+  if (session.errors && session.errors.length) {
+    const banner = document.createElement("div");
+    banner.className = "warning-banner";
+    banner.setAttribute("role", "alert");
+    banner.innerHTML = `<strong>${session.errors.length} file(s) failed during analysis</strong><ul>` +
+      session.errors.map((e) => `<li>${escapeHTML(e.file)} ${e.stage ? `[${escapeHTML(e.stage)}]` : ""}: ${escapeHTML(e.message)}</li>`).join("") +
+      `</ul>`;
+    reviewList.appendChild(banner);
+  }
 
   for (const file of session.files) {
     const card = document.createElement("section");
@@ -130,10 +179,19 @@ function showReview() {
     const fileHeader = document.createElement("div");
     fileHeader.className = "file-header";
     fileHeader.innerHTML = `
-      <h3>${file.originalName} <span class="muted">&rarr; ${file.outputBase}.pdf</span></h3>
+      <h3>${escapeHTML(file.originalName)} <span class="muted">&rarr; ${escapeHTML(file.outputBase)}.pdf</span></h3>
       <div class="muted small">${file.figures.length} figure(s)</div>
     `;
     card.appendChild(fileHeader);
+
+    if (file.warnings && file.warnings.length) {
+      const w = document.createElement("div");
+      w.className = "warning-banner";
+      w.innerHTML = `<strong>Partial success:</strong><ul>` +
+        file.warnings.map((x) => `<li>${escapeHTML(x.stage)}: ${escapeHTML(x.message)}</li>`).join("") +
+        `</ul>`;
+      card.appendChild(w);
+    }
 
     if (file.figures.length === 0) {
       const none = document.createElement("p");

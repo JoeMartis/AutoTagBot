@@ -233,9 +233,15 @@ async function generateAltBatch(anthropic, figures) {
       const i = cursor++;
       if (i >= figures.length) return;
       try {
-        results[i] = await generateAlt(anthropic, figures[i].renditionPath);
+        results[i] = await withRetry(
+          () => generateAlt(anthropic, figures[i].renditionPath),
+          { label: `claude figure ${i}`, attempts: 4, baseMs: 1500 },
+        );
       } catch (err) {
-        results[i] = `[draft failed: ${err.message || err}]`;
+        // Leave alt empty so the user just sees an empty textarea instead of
+        // pasted-in error text. Per-file warning surfaces in the response.
+        console.warn(`[claude] figure ${i} failed: ${describeError(err)}`);
+        results[i] = "";
       }
     }
   }
@@ -251,12 +257,46 @@ async function buildThumbnail(renditionPath) {
   return `data:${mediaType};base64,${buf.toString("base64")}`;
 }
 
+function describeError(err) {
+  if (!err) return "unknown error";
+  // Adobe SDK errors carry useful detail on `.statusCode`/`.response.body`.
+  const parts = [];
+  if (err.statusCode) parts.push(`HTTP ${err.statusCode}`);
+  if (err.message) parts.push(err.message);
+  if (err.response && err.response.body) {
+    try {
+      const body = typeof err.response.body === "string" ? err.response.body : JSON.stringify(err.response.body);
+      if (body && !parts.join(" ").includes(body.slice(0, 80))) parts.push(body.slice(0, 300));
+    } catch {}
+  }
+  return parts.join(" — ") || String(err);
+}
+
+async function withRetry(fn, { attempts = 3, baseMs = 1000, label = "call" } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const status = err.status || err.statusCode;
+      const retriable = status === 429 || (status >= 500 && status < 600) || err.code === "ECONNRESET" || err.code === "ETIMEDOUT";
+      if (i === attempts - 1 || !retriable) throw err;
+      const delay = baseMs * Math.pow(2, i);
+      console.warn(`[retry] ${label} failed (${describeError(err)}); retrying in ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 app.post("/api/analyze", upload.array("files"), async (req, res) => {
   const clientId = req.body.clientId;
   const clientSecret = req.body.clientSecret;
   const anthropicKey = req.body.anthropicKey;
+  const draftAlt = req.body.draftAlt === "true";
   if (!clientId || !clientSecret) return res.status(400).json({ error: "Missing Adobe credentials." });
-  if (!anthropicKey) return res.status(400).json({ error: "Missing Anthropic API key." });
+  if (draftAlt && !anthropicKey) return res.status(400).json({ error: "Anthropic API key required when 'draft alt text' is on." });
   if (!req.files || req.files.length === 0) return res.status(400).json({ error: "No PDF files uploaded." });
 
   let outputNames = [];
@@ -270,6 +310,7 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
     shiftHeadings: req.body.shiftHeadings === "true",
     generateReport: req.body.generateReport === "true",
     runAccessibilityChecker: req.body.runAccessibilityChecker === "true",
+    draftAlt,
     pageStart: req.body.pageStart ? parseInt(req.body.pageStart, 10) : null,
     pageEnd: req.body.pageEnd ? parseInt(req.body.pageEnd, 10) : null,
   };
@@ -281,7 +322,7 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
 
   const credentials = new ServicePrincipalCredentials({ clientId, clientSecret });
   const pdfServices = new PDFServices({ credentials });
-  const anthropic = new Anthropic({ apiKey: anthropicKey });
+  const anthropic = draftAlt ? new Anthropic({ apiKey: anthropicKey }) : null;
 
   // Credentials are held in the session so /api/finalize can re-run the
   // checker on the rewritten PDF without asking the user to re-enter them.
@@ -306,8 +347,13 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
         applyPattern(pattern, originalBase),
       );
 
+      const warnings = [];
+      let stage = "autotag";
       try {
-        const autoTagResult = await runAutotag(pdfServices, file.path, options);
+        const autoTagResult = await withRetry(
+          () => runAutotag(pdfServices, file.path, options),
+          { label: `autotag ${file.originalname}` },
+        );
         const taggedPath = path.join(workDir, `${outputBase}.pdf`);
         await downloadAssetToFile(pdfServices, autoTagResult.taggedPDF, taggedPath);
 
@@ -317,12 +363,33 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           await downloadAssetToFile(pdfServices, autoTagResult.report, taggingReportPath);
         }
 
-        const extractDir = path.join(workDir, `extract-${i}`);
-        const extractResult = await runExtract(pdfServices, taggedPath);
-        const { json: structured } = await unzipExtractResult(pdfServices, extractResult, extractDir);
-        const figs = collectFigures(structured, extractDir);
+        // Extract is independent of the rest — if it fails, the file can still
+        // be exported as a tagged PDF with no figures surfaced for review.
+        let figs = [];
+        try {
+          stage = "extract";
+          const extractDir = path.join(workDir, `extract-${i}`);
+          const extractResult = await withRetry(
+            () => runExtract(pdfServices, taggedPath),
+            { label: `extract ${file.originalname}` },
+          );
+          const { json: structured } = await unzipExtractResult(pdfServices, extractResult, extractDir);
+          figs = collectFigures(structured, extractDir);
+        } catch (err) {
+          warnings.push({ stage: "extract", message: describeError(err) });
+        }
 
-        const drafts = figs.length ? await generateAltBatch(anthropic, figs) : [];
+        let drafts = [];
+        if (options.draftAlt && anthropic && figs.length) {
+          stage = "claude";
+          try {
+            drafts = await generateAltBatch(anthropic, figs);
+          } catch (err) {
+            warnings.push({ stage: "claude", message: describeError(err) });
+            drafts = figs.map(() => "");
+          }
+        }
+
         const figuresResp = [];
         for (let f = 0; f < figs.length; f++) {
           const figureId = `${i}-${f}`;
@@ -350,9 +417,14 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           originalName: file.originalname,
           outputBase,
           figures: figuresResp,
+          warnings,
         });
       } catch (err) {
-        errors.push({ file: file.originalname, message: err.message || String(err) });
+        errors.push({
+          file: file.originalname,
+          stage,
+          message: describeError(err),
+        });
       }
     }
 
