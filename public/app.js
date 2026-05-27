@@ -258,9 +258,12 @@ function showReview() {
         const row = document.createElement("div");
         row.className = "figure-row";
         row.dataset.id = fig.id;
+        const thumbHtml = fig.thumbnail
+          ? `<img src="${fig.thumbnail}" alt="" />`
+          : `<div class="figure-thumb-missing">No preview</div>`;
         row.innerHTML = `
           <div class="figure-thumb">
-            <img src="${fig.thumbnail}" alt="" />
+            ${thumbHtml}
             <div class="figure-meta">p.${fig.page ?? "?"}</div>
           </div>
           <div class="figure-edit">

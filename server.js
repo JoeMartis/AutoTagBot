@@ -90,12 +90,16 @@ const upload = multer({
 // In-memory session store: sessionId -> { createdAt, workDir, options, files: [{outputBase, taggedPath, figures}] }
 const sessions = new Map();
 
+// TTL sweeper: drop credentials and workDir for sessions older than the TTL.
+// The dedicated cancel path is preferred; this is the safety net for users
+// who close the tab without exporting.
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
     if (now - s.createdAt > SESSION_TTL_MS) {
-      fsp.rm(s.workDir, { recursive: true, force: true }).catch(() => {});
+      s.credentials = null;
       sessions.delete(id);
+      fsp.rm(s.workDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 }, 5 * 60 * 1000).unref();
@@ -106,7 +110,9 @@ function sanitizeName(name, fallback) {
 }
 
 function applyPattern(pattern, basename) {
-  return pattern.replace(/\{name\}/g, basename).replace(/\{basename\}/g, basename);
+  // Use a callback so that `$&`, `$1`, `$\``, `$'` in the user-controlled
+  // basename aren't interpreted as String.replace replacement patterns.
+  return pattern.replace(/\{name\}|\{basename\}/g, () => basename);
 }
 
 async function streamToFile(readStream, destPath) {
@@ -180,18 +186,24 @@ async function unzipExtractResult(pdfServices, extractResult, destDir) {
 }
 
 function collectFigures(structuredData, extractDir) {
+  // Important: do NOT filter out figures whose rendition file is missing.
+  // read_alt.py and apply_alt.py walk the PDF struct tree unfiltered, so the
+  // i-th entry here MUST line up with the i-th /Figure StructElem. Dropping
+  // figures here shifts subsequent alts onto the wrong figures, silently.
   const figs = [];
   for (const el of structuredData.elements || []) {
     if (!el.Path || !el.Path.includes("Figure")) continue;
+    let renditionPath = null;
     const rendition = (el.filePaths || []).find((p) => /figures\//i.test(p));
-    if (!rendition) continue;
-    const absPath = path.join(extractDir, rendition);
-    if (!fs.existsSync(absPath)) continue;
+    if (rendition) {
+      const absPath = path.join(extractDir, rendition);
+      if (fs.existsSync(absPath)) renditionPath = absPath;
+    }
     figs.push({
       path: el.Path,
       page: typeof el.Page === "number" ? el.Page + 1 : null,
       bbox: el.Bounds || null,
-      renditionPath: absPath,
+      renditionPath,
     });
   }
   return figs;
@@ -237,20 +249,22 @@ async function generateAlt(anthropic, renditionPath) {
 }
 
 async function generateAltBatch(anthropic, figures) {
-  const results = new Array(figures.length);
+  const results = new Array(figures.length).fill("");
   let cursor = 0;
   async function worker() {
     while (true) {
       const i = cursor++;
       if (i >= figures.length) return;
+      // Figures whose rendition file is missing have no image for Claude
+      // to look at. Leave the draft empty; the user can still type alt
+      // text against the page-number hint and tag-tree path.
+      if (!figures[i].renditionPath) continue;
       try {
         results[i] = await withRetry(
           () => generateAlt(anthropic, figures[i].renditionPath),
           { label: `claude figure ${i}`, attempts: 4, baseMs: 1500 },
         );
       } catch (err) {
-        // Leave alt empty so the user just sees an empty textarea instead of
-        // pasted-in error text. Per-file warning surfaces in the response.
         console.warn(`[claude] figure ${i} failed: ${describeError(err)}`);
         results[i] = "";
       }
@@ -261,7 +275,7 @@ async function generateAltBatch(anthropic, figures) {
 }
 
 async function buildThumbnail(renditionPath) {
-  // Just inline the rendition. Adobe's figure renditions are already reasonably sized.
+  if (!renditionPath) return null;
   const buf = await fsp.readFile(renditionPath);
   const ext = path.extname(renditionPath).toLowerCase().replace(".", "");
   const mediaType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : "image/png";
@@ -302,53 +316,58 @@ async function withRetry(fn, { attempts = 3, baseMs = 1000, label = "call" } = {
 }
 
 app.post("/api/analyze", upload.array("files"), async (req, res) => {
-  const clientId = req.body.clientId;
-  const clientSecret = req.body.clientSecret;
-  const anthropicKey = req.body.anthropicKey;
-  const draftAlt = req.body.draftAlt === "true";
-  if (!clientId || !clientSecret) return res.status(400).json({ error: "Missing Adobe credentials." });
-  if (draftAlt && !anthropicKey) return res.status(400).json({ error: "Anthropic API key required when 'draft alt text' is on." });
-  if (!req.files || req.files.length === 0) return res.status(400).json({ error: "No PDF files uploaded." });
-
-  let outputNames = [];
+  // Single try/finally wrapping the whole handler so the multer-uploaded
+  // temp dirs are always cleaned, even on early validation returns.
+  let workDir = null;
+  let sessionStored = false;
+  let sessionRef = null;
+  let sessionId = null;
   try {
-    outputNames = req.body.outputNames ? JSON.parse(req.body.outputNames) : [];
-  } catch {
-    return res.status(400).json({ error: "Invalid outputNames JSON." });
-  }
+    const clientId = req.body.clientId;
+    const clientSecret = req.body.clientSecret;
+    const anthropicKey = req.body.anthropicKey;
+    const draftAlt = req.body.draftAlt === "true";
+    if (!clientId || !clientSecret) return res.status(400).json({ error: "Missing Adobe credentials." });
+    if (draftAlt && !anthropicKey) return res.status(400).json({ error: "Anthropic API key required when 'draft alt text' is on." });
+    if (!req.files || req.files.length === 0) return res.status(400).json({ error: "No PDF files uploaded." });
 
-  const options = {
-    shiftHeadings: req.body.shiftHeadings === "true",
-    generateReport: req.body.generateReport === "true",
-    runAccessibilityChecker: req.body.runAccessibilityChecker === "true",
-    draftAlt,
-    pageStart: req.body.pageStart ? parseInt(req.body.pageStart, 10) : null,
-    pageEnd: req.body.pageEnd ? parseInt(req.body.pageEnd, 10) : null,
-  };
-  const pattern = req.body.namePattern || "{name}-tagged";
+    let outputNames = [];
+    try {
+      outputNames = req.body.outputNames ? JSON.parse(req.body.outputNames) : [];
+    } catch {
+      return res.status(400).json({ error: "Invalid outputNames JSON." });
+    }
 
-  const sessionId = crypto.randomBytes(12).toString("hex");
-  const workDir = path.join(os.tmpdir(), "autotagbot-sess-" + sessionId);
-  await fsp.mkdir(workDir, { recursive: true });
+    const options = {
+      shiftHeadings: req.body.shiftHeadings === "true",
+      generateReport: req.body.generateReport === "true",
+      runAccessibilityChecker: req.body.runAccessibilityChecker === "true",
+      draftAlt,
+      pageStart: req.body.pageStart ? parseInt(req.body.pageStart, 10) : null,
+      pageEnd: req.body.pageEnd ? parseInt(req.body.pageEnd, 10) : null,
+    };
+    const pattern = req.body.namePattern || "{name}-tagged";
 
-  const credentials = new ServicePrincipalCredentials({ clientId, clientSecret });
-  const pdfServices = new PDFServices({ credentials });
-  const anthropic = draftAlt ? new Anthropic({ apiKey: anthropicKey }) : null;
+    sessionId = crypto.randomBytes(12).toString("hex");
+    workDir = path.join(os.tmpdir(), "autotagbot-sess-" + sessionId);
+    await fsp.mkdir(workDir, { recursive: true });
 
-  // Credentials are held in the session so /api/finalize can re-run the
-  // checker on the rewritten PDF without asking the user to re-enter them.
-  // Same trust model as before: in-memory only, dropped when the session ends.
-  const session = {
-    createdAt: Date.now(),
-    workDir,
-    options,
-    files: [],
-    credentials: { clientId, clientSecret },
-  };
-  const errors = [];
-  const responseFiles = [];
+    const credentials = new ServicePrincipalCredentials({ clientId, clientSecret });
+    const pdfServices = new PDFServices({ credentials });
+    const anthropic = draftAlt ? new Anthropic({ apiKey: anthropicKey }) : null;
 
-  try {
+    const session = {
+      createdAt: Date.now(),
+      workDir,
+      options,
+      files: [],
+      credentials: { clientId, clientSecret },
+    };
+    sessionRef = session;
+    const errors = [];
+    const responseFiles = [];
+
+    try {
     for (let i = 0; i < req.files.length; i++) {
       const file = req.files[i];
       const originalBase = path.parse(file.originalname).name;
@@ -398,6 +417,16 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
         try {
           const read = await runPython(READ_ALT_SCRIPT, ["--in", taggedPath]);
           existingAlts = (read && read.alts) || [];
+          // If Adobe Extract's figure count and pikepdf's /Figure count
+          // diverge, ordinal matching will silently misalign alt text onto
+          // the wrong figures. Surface the mismatch so the user knows the
+          // existing-alt column may be off.
+          if (existingAlts.length !== figs.length) {
+            warnings.push({
+              stage: "figure-count-mismatch",
+              message: `Adobe Extract reported ${figs.length} figure(s), pikepdf found ${existingAlts.length} /Figure StructElem(s). Existing alt text may not line up with the displayed figures; review carefully.`,
+            });
+          }
         } catch (err) {
           warnings.push({ stage: "read-existing-alt", message: describeError(err) });
         }
@@ -453,21 +482,32 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
       }
     }
 
-    if (session.files.length === 0) {
-      await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
-      return res.status(500).json({ error: "All files failed.", errors });
-    }
+      if (session.files.length === 0) {
+        return res.status(500).json({ error: "All files failed.", errors });
+      }
 
-    sessions.set(sessionId, session);
-    res.json({ sessionId, files: responseFiles, errors });
-  } catch (err) {
-    console.error(err);
-    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
-    if (!res.headersSent) res.status(500).json({ error: err.message || "Analyze failed." });
+      sessions.set(sessionId, session);
+      sessionStored = true;
+      res.json({ sessionId, files: responseFiles, errors });
+    } catch (err) {
+      console.error(err);
+      if (!res.headersSent) res.status(500).json({ error: err.message || "Analyze failed." });
+    }
   } finally {
-    // Clean up the upload temp dirs (we've copied what we need into workDir).
-    const uploadDirs = new Set(req.files.map((f) => path.dirname(f.path)));
-    for (const dir of uploadDirs) fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    // Always clean up the per-file upload temp dirs (multer writes them
+    // before this handler runs, so they leak unless we run regardless of
+    // whether validation passed).
+    if (req.files) {
+      const uploadDirs = new Set(req.files.map((f) => path.dirname(f.path)));
+      for (const dir of uploadDirs) fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+    // If the session never made it into the map (early return, failed
+    // batch, or thrown error), drop its workDir and clear the credentials
+    // we may have stashed on the session object.
+    if (workDir && !sessionStored) {
+      if (sessionRef) sessionRef.credentials = null;
+      fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 });
 
@@ -528,41 +568,32 @@ async function applyAltAndCheck(session, file, altById) {
   return { manifest, rewrittenPath, rewriteReport, rewriteError, checkerPdfPath, checkerReportPath, checkerError };
 }
 
-app.post("/api/finalize", async (req, res) => {
-  const { sessionId, altText } = req.body || {};
-  if (!sessionId || !sessions.has(sessionId)) return res.status(404).json({ error: "Session not found or expired." });
-  const session = sessions.get(sessionId);
-  const altById = altText || {};
+function escapeCsvCell(value) {
+  const s = value == null ? "" : String(value);
+  // Quote everything; double internal quotes; this keeps newlines inside the
+  // quoted cell rather than breaking the row.
+  return `"${s.replace(/"/g, '""')}"`;
+}
 
-  // Process each file before opening the zip so a fatal apply_alt failure
-  // (e.g. pikepdf missing) returns a clean JSON error instead of a broken stream.
-  const perFile = [];
-  for (const file of session.files) {
-    const result = await applyAltAndCheck(session, file, altById);
-    perFile.push({ file, ...result });
-  }
-
-  // If every file failed the rewrite, return a 500 with the first error so the
-  // user sees the underlying cause instead of a zip with no PDFs in it.
-  if (perFile.every((p) => p.rewriteError)) {
-    const first = perFile.find((p) => p.rewriteError);
-    return res.status(500).json({
-      error: "Alt-text write-back failed for every file.",
-      detail: first ? first.rewriteError : null,
-      hint: "Ensure Python 3 and pikepdf are installed on the server: pip install pikepdf",
+async function buildZipToDisk(zipPath, perFile) {
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    let settled = false;
+    const done = (err) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err); else resolve();
+    };
+    archive.on("warning", (err) => {
+      if (err.code === "ENOENT") console.warn("archive warning:", err);
+      else done(err);
     });
-  }
+    archive.on("error", done);
+    output.on("error", done);
+    output.on("close", () => done(null));
+    archive.pipe(output);
 
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", `attachment; filename="autotagbot-batch.zip"`);
-  const archive = archiver("zip", { zlib: { level: 9 } });
-  archive.on("error", (err) => {
-    console.error("archive error", err);
-    try { res.end(); } catch {}
-  });
-  archive.pipe(res);
-
-  try {
     for (const p of perFile) {
       const { file, manifest, rewrittenPath, rewriteReport, rewriteError, checkerPdfPath, checkerReportPath, checkerError } = p;
 
@@ -582,36 +613,116 @@ app.post("/api/finalize", async (req, res) => {
 
       archive.append(JSON.stringify(manifest, null, 2), { name: `${file.outputBase}-alt-text.json` });
 
-      const csvHeader = "id,path,page,decorative,complex,alt\n";
+      // UTF-8 BOM so Excel renders non-ASCII alt text correctly; every cell quoted so
+      // newlines, commas, and quotes inside alt text don't break the row layout.
+      const csvHeader = "﻿" + ["id", "path", "page", "decorative", "complex", "alt"].join(",") + "\n";
       const csvBody = manifest
-        .map((m) => {
-          const alt = (m.alt || "").replace(/"/g, '""');
-          const pp = (m.path || "").replace(/"/g, '""');
-          return `${m.id},"${pp}",${m.page ?? ""},${m.decorative},${m.complex},"${alt}"`;
-        })
+        .map((m) => [
+          escapeCsvCell(m.id),
+          escapeCsvCell(m.path),
+          escapeCsvCell(m.page),
+          escapeCsvCell(m.decorative),
+          escapeCsvCell(m.complex),
+          escapeCsvCell(m.alt),
+        ].join(","))
         .join("\n");
       archive.append(csvHeader + csvBody + "\n", { name: `${file.outputBase}-alt-text.csv` });
 
       if (rewriteReport || rewriteError || checkerError) {
         archive.append(
-          JSON.stringify(
-            { rewrite: rewriteReport || null, rewriteError, checkerError },
-            null,
-            2,
-          ),
+          JSON.stringify({ rewrite: rewriteReport || null, rewriteError, checkerError }, null, 2),
           { name: `${file.outputBase}-process-report.json` },
         );
       }
     }
 
-    await archive.finalize();
+    archive.finalize().catch(done);
+  });
+}
+
+app.post("/api/finalize", async (req, res) => {
+  const { sessionId, altText } = req.body || {};
+  if (!sessionId || !sessions.has(sessionId)) return res.status(404).json({ error: "Session not found or expired." });
+  const session = sessions.get(sessionId);
+  const altById = altText || {};
+
+  // One try/finally for the whole handler so credentials and workDir are
+  // always cleaned up — including the all-files-failed early return, any
+  // unexpected throw from applyAltAndCheck, and the success path.
+  let zipPath = null;
+  try {
+    // Process each file before opening the zip so a fatal apply_alt failure
+    // (e.g. pikepdf missing, workDir gone after a concurrent /api/cancel)
+    // returns a clean JSON error instead of a half-streamed zip.
+    const perFile = [];
+    for (const file of session.files) {
+      let result;
+      try {
+        result = await applyAltAndCheck(session, file, altById);
+      } catch (err) {
+        // Unexpected throw — most likely a disk write error or workDir vanished.
+        // Fall back to passing through the original tagged PDF for this file so
+        // the rest of the batch can still ship.
+        result = {
+          manifest: file.figures.map((f) => ({
+            id: f.id, path: f.path, page: f.page, bbox: f.bbox,
+            alt: (altById[f.id] && altById[f.id].alt) || "",
+            decorative: !!(altById[f.id] && altById[f.id].decorative),
+            complex: !!(altById[f.id] && altById[f.id].complex),
+          })),
+          rewrittenPath: null,
+          rewriteReport: null,
+          rewriteError: describeError(err),
+          checkerPdfPath: null,
+          checkerReportPath: null,
+          checkerError: null,
+        };
+      }
+      perFile.push({ file, ...result });
+    }
+
+    // If every file failed the rewrite, return a 500 with the first error so the
+    // user sees the underlying cause instead of a zip with no PDFs in it.
+    if (perFile.every((p) => p.rewriteError)) {
+      const first = perFile.find((p) => p.rewriteError);
+      return res.status(500).json({
+        error: "Alt-text write-back failed for every file.",
+        detail: first ? first.rewriteError : null,
+        hint: "Ensure Python 3 and pikepdf are installed on the server: pip install pikepdf",
+      });
+    }
+
+    // Build the zip on disk first. Headers go out only AFTER we know it's
+    // complete, so a mid-archive error can return a JSON 500 instead of
+    // silently delivering a truncated zip with HTTP 200.
+    zipPath = path.join(session.workDir, "autotagbot-batch.zip");
+    try {
+      await buildZipToDisk(zipPath, perFile);
+    } catch (err) {
+      console.error("archive build failed:", err);
+      return res.status(500).json({ error: "Failed to build the export zip.", detail: describeError(err) });
+    }
+
+    const stat = await fsp.stat(zipPath);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="autotagbot-batch.zip"`);
+    res.setHeader("Content-Length", stat.size);
+
+    await new Promise((resolve, reject) => {
+      const rs = fs.createReadStream(zipPath);
+      rs.on("error", reject);
+      res.on("close", resolve);
+      res.on("error", reject);
+      rs.pipe(res);
+    });
   } catch (err) {
     console.error(err);
+    if (!res.headersSent) res.status(500).json({ error: "Finalize failed.", detail: describeError(err) });
   } finally {
-    // Drop credentials and clean up.
-    session.credentials = null;
-    fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
+    // Drop credentials and clean up regardless of which branch we left through.
+    if (session) session.credentials = null;
     sessions.delete(sessionId);
+    fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
@@ -619,11 +730,16 @@ app.post("/api/cancel", async (req, res) => {
   const { sessionId } = req.body || {};
   if (sessionId && sessions.has(sessionId)) {
     const s = sessions.get(sessionId);
-    await fsp.rm(s.workDir, { recursive: true, force: true }).catch(() => {});
+    // Null the credentials first so any in-flight handler holding a strong
+    // reference (e.g. a concurrent finalize) drops the secret immediately
+    // rather than at the end of its closure.
+    s.credentials = null;
     sessions.delete(sessionId);
+    await fsp.rm(s.workDir, { recursive: true, force: true }).catch(() => {});
   }
   res.json({ ok: true });
 });
+
 
 app.listen(PORT, () => {
   console.log(`AutoTagBot listening on http://localhost:${PORT}`);
