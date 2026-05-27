@@ -69,11 +69,50 @@ function renderFileList() {
   });
 }
 
-fileInput.addEventListener("change", (e) => {
-  const newOnes = Array.from(e.target.files).map((file) => ({ file, customName: "" }));
-  selectedFiles = selectedFiles.concat(newOnes);
-  fileInput.value = "";
+function addFiles(fileList) {
+  const incoming = Array.from(fileList).filter(
+    (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name),
+  );
+  if (incoming.length === 0) return;
+  selectedFiles = selectedFiles.concat(incoming.map((file) => ({ file, customName: "" })));
   renderFileList();
+}
+
+fileInput.addEventListener("change", (e) => {
+  addFiles(e.target.files);
+  fileInput.value = "";
+});
+
+// Drag-and-drop on the entire .filedrop label, plus a window-level
+// preventDefault so the browser doesn't navigate away if the user
+// misses the drop zone.
+const dropZone = document.querySelector(".filedrop");
+["dragenter", "dragover"].forEach((evt) => {
+  dropZone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropZone.classList.add("dragover");
+  });
+});
+["dragleave", "dragend"].forEach((evt) => {
+  dropZone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (evt === "dragleave" && dropZone.contains(e.relatedTarget)) return;
+    dropZone.classList.remove("dragover");
+  });
+});
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  dropZone.classList.remove("dragover");
+  if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+});
+// Swallow stray drops on the rest of the page so the browser doesn't open the PDF.
+["dragover", "drop"].forEach((evt) => {
+  window.addEventListener(evt, (e) => {
+    if (!dropZone.contains(e.target)) e.preventDefault();
+  });
 });
 
 function setStatus(el, msg, kind) {
