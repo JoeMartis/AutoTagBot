@@ -1,13 +1,13 @@
 ---
 title: AutoTagBot
 emoji: 📄
-colorFrom: orange
-colorTo: red
+colorFrom: red
+colorTo: pink
 sdk: docker
 app_port: 7860
 pinned: false
 license: mit
-short_description: Batch-process PDFs through Adobe Auto-Tag with Claude alt-text drafts
+short_description: Batch PDF auto-tag with Claude alt-text drafts
 ---
 
 # AutoTagBot
