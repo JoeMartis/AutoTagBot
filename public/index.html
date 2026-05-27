@@ -11,31 +11,42 @@
     <main>
       <header>
         <h1>AutoTagBot</h1>
-        <p class="sub">Batch-tag PDFs, draft alt text with Claude, review, then export.</p>
+        <p class="sub">Batch-tag PDFs, optionally draft alt text with Claude, review, then export.</p>
       </header>
 
       <!-- STEP 1: submit -->
-      <section id="step-submit">
-        <form id="batch-form">
-          <section class="card">
-            <h2>1. Credentials</h2>
-            <p class="hint">Held in memory for this batch only. Never written to disk.</p>
+      <section id="step-submit" aria-labelledby="step-submit-heading">
+        <h2 id="step-submit-heading" class="sr-only">Submit batch</h2>
+        <form id="batch-form" novalidate>
+          <section class="card" aria-labelledby="creds-heading">
+            <h2 id="creds-heading">1. Credentials</h2>
+            <p class="hint" id="creds-hint">
+              Used only for this batch and dropped from memory when the export finishes.
+              Nothing is written to disk and the values aren't logged.
+            </p>
             <label>
               <span>Adobe client_id</span>
-              <input type="password" name="clientId" autocomplete="off" required />
+              <input type="password" name="clientId" autocomplete="off" required aria-required="true" aria-describedby="creds-hint" />
             </label>
             <label>
               <span>Adobe client_secret</span>
-              <input type="password" name="clientSecret" autocomplete="off" required />
+              <input type="password" name="clientSecret" autocomplete="off" required aria-required="true" />
             </label>
-            <label>
+            <label class="check" style="margin-top: 12px;">
+              <input type="checkbox" id="draft-alt-toggle" name="draftAlt" checked />
+              <span style="font-weight: 500;">Draft alt text with Claude</span>
+            </label>
+            <p class="hint" style="margin: 4px 0 8px 26px;">
+              Generates a starting-point description for each figure. Turn off if you'd rather write all alt text yourself.
+            </p>
+            <label id="anthropic-key-label">
               <span>Anthropic API key</span>
-              <input type="password" name="anthropicKey" autocomplete="off" required />
+              <input type="password" name="anthropicKey" autocomplete="off" required aria-required="true" />
             </label>
           </section>
 
-          <section class="card">
-            <h2>2. Options</h2>
+          <section class="card" aria-labelledby="options-heading">
+            <h2 id="options-heading">2. Options</h2>
             <div class="grid">
               <label class="check">
                 <input type="checkbox" name="runAccessibilityChecker" checked />
@@ -62,17 +73,19 @@
             </div>
           </section>
 
-          <section class="card">
-            <h2>3. Files &amp; naming</h2>
-            <label class="filedrop">
+          <section class="card" aria-labelledby="files-heading">
+            <h2 id="files-heading">3. Files &amp; naming</h2>
+            <label class="filedrop" for="files">
               <input type="file" id="files" name="files" accept="application/pdf" multiple />
               <span>Drop PDFs here or click to choose</span>
             </label>
 
             <label>
               <span>Batch name pattern</span>
-              <input type="text" id="pattern" name="namePattern" value="{name}-tagged" />
-              <small class="hint"><code>{name}</code> = original filename without extension. Applied to any file you don't rename.</small>
+              <input type="text" id="pattern" name="namePattern" value="{name}-tagged" aria-describedby="pattern-hint" />
+              <small class="hint" id="pattern-hint">
+                <code>{name}</code> = original filename without extension. Used for any file you don't rename below.
+              </small>
             </label>
 
             <div id="file-list"></div>
@@ -84,10 +97,10 @@
       </section>
 
       <!-- STEP 2: review -->
-      <section id="step-review" hidden>
+      <section id="step-review" hidden aria-labelledby="review-heading">
         <div class="review-header card">
           <div>
-            <h2>Review draft alt text</h2>
+            <h2 id="review-heading">Review alt text</h2>
             <p class="hint" id="review-summary"></p>
           </div>
           <div class="review-actions">
