@@ -7,21 +7,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pikepdf \
     && rm -rf /var/lib/apt/lists/*
 
-# Hugging Face Spaces requires a non-root user with uid 1000.
-RUN useradd -m -u 1000 user
-USER user
-ENV HOME=/home/user \
+# The node:* images already ship a `node` user at uid 1000, which is what
+# Hugging Face Spaces require. Reuse it instead of creating a new account.
+USER node
+ENV HOME=/home/node \
     PORT=7860 \
     NODE_ENV=production
 
-WORKDIR /home/user/app
+WORKDIR /home/node/app
 
 # Node deps first for layer caching.
-COPY --chown=user package.json package-lock.json ./
+COPY --chown=node package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # App code.
-COPY --chown=user . .
+COPY --chown=node . .
 
 EXPOSE 7860
 
