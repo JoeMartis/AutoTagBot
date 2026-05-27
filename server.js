@@ -113,6 +113,22 @@ async function runExtract(pdfServices, inputPath) {
   return response.result;
 }
 
+async function runAccessibilityChecker(pdfServices, inputPath, options) {
+  const readStream = fs.createReadStream(inputPath);
+  const inputAsset = await pdfServices.upload({ readStream, mimeType: MimeType.PDF });
+  const cfg = {};
+  if (options.pageStart) cfg.pageStart = options.pageStart;
+  if (options.pageEnd) cfg.pageEnd = options.pageEnd;
+  const params = new PDFAccessibilityCheckerParams(cfg);
+  const job = new PDFAccessibilityCheckerJob({ inputAsset, params });
+  const pollingURL = await pdfServices.submit({ job });
+  const response = await pdfServices.getJobResult({
+    pollingURL,
+    resultType: PDFAccessibilityCheckerResult,
+  });
+  return response.result;
+}
+
 async function unzipExtractResult(pdfServices, extractResult, destDir) {
   await fsp.mkdir(destDir, { recursive: true });
   const zipPath = path.join(destDir, "extract.zip");
@@ -265,6 +281,20 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           await downloadAssetToFile(pdfServices, autoTagResult.report, taggingReportPath);
         }
 
+        let checkerPdfPath = null;
+        let checkerReportPath = null;
+        if (options.runAccessibilityChecker) {
+          const checkerResult = await runAccessibilityChecker(pdfServices, taggedPath, options);
+          if (checkerResult.asset) {
+            checkerPdfPath = path.join(workDir, `${outputBase}-accessibility.pdf`);
+            await downloadAssetToFile(pdfServices, checkerResult.asset, checkerPdfPath);
+          }
+          if (checkerResult.report) {
+            checkerReportPath = path.join(workDir, `${outputBase}-accessibility-report.json`);
+            await downloadAssetToFile(pdfServices, checkerResult.report, checkerReportPath);
+          }
+        }
+
         const extractDir = path.join(workDir, `extract-${i}`);
         const extractResult = await runExtract(pdfServices, taggedPath);
         const { json: structured } = await unzipExtractResult(pdfServices, extractResult, extractDir);
@@ -290,6 +320,8 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           originalName: file.originalname,
           taggedPath,
           taggingReportPath,
+          checkerPdfPath,
+          checkerReportPath,
           figures: figs.map((f, idx) => ({ ...f, id: `${i}-${idx}` })),
         });
 
@@ -342,6 +374,12 @@ app.post("/api/finalize", async (req, res) => {
       archive.file(file.taggedPath, { name: `${file.outputBase}.pdf` });
       if (file.taggingReportPath) {
         archive.file(file.taggingReportPath, { name: `${file.outputBase}-tagging-report.xlsx` });
+      }
+      if (file.checkerPdfPath) {
+        archive.file(file.checkerPdfPath, { name: `${file.outputBase}-accessibility.pdf` });
+      }
+      if (file.checkerReportPath) {
+        archive.file(file.checkerReportPath, { name: `${file.outputBase}-accessibility-report.json` });
       }
 
       const manifest = file.figures.map((f) => ({
