@@ -5,12 +5,16 @@ const submitBtn = document.getElementById("submit-btn");
 const statusEl = document.getElementById("status");
 const patternInput = document.getElementById("pattern");
 
-let selectedFiles = [];
+const stepSubmit = document.getElementById("step-submit");
+const stepReview = document.getElementById("step-review");
+const reviewList = document.getElementById("review-list");
+const reviewSummary = document.getElementById("review-summary");
+const finalizeBtn = document.getElementById("finalize-btn");
+const backBtn = document.getElementById("back-btn");
+const reviewStatus = document.getElementById("review-status");
 
-function basename(name) {
-  const dot = name.lastIndexOf(".");
-  return dot > 0 ? name.slice(0, dot) : name;
-}
+let selectedFiles = [];
+let session = null; // { sessionId, files: [{ originalName, outputBase, figures: [...] }] }
 
 function renderFileList() {
   fileList.innerHTML = "";
@@ -36,19 +40,16 @@ function renderFileList() {
     `;
     tbody.appendChild(tr);
   });
-
   fileList.appendChild(table);
 
   fileList.querySelectorAll("input.rename").forEach((inp) => {
     inp.addEventListener("input", (e) => {
-      const i = Number(e.target.dataset.i);
-      selectedFiles[i].customName = e.target.value;
+      selectedFiles[Number(e.target.dataset.i)].customName = e.target.value;
     });
   });
   fileList.querySelectorAll("button.remove").forEach((btn) => {
     btn.addEventListener("click", (e) => {
-      const i = Number(e.target.dataset.i);
-      selectedFiles.splice(i, 1);
+      selectedFiles.splice(Number(e.target.dataset.i), 1);
       renderFileList();
     });
   });
@@ -61,42 +62,153 @@ fileInput.addEventListener("change", (e) => {
   renderFileList();
 });
 
-function setStatus(msg, kind) {
-  statusEl.textContent = msg;
-  statusEl.className = kind || "";
+function setStatus(el, msg, kind) {
+  el.textContent = msg;
+  el.className = kind || "";
 }
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (selectedFiles.length === 0) {
-    setStatus("Add at least one PDF.", "err");
+    setStatus(statusEl, "Add at least one PDF.", "err");
     return;
   }
 
   const fd = new FormData();
-  const clientId = form.elements.clientId.value.trim();
-  const clientSecret = form.elements.clientSecret.value.trim();
-  fd.append("clientId", clientId);
-  fd.append("clientSecret", clientSecret);
+  fd.append("clientId", form.elements.clientId.value.trim());
+  fd.append("clientSecret", form.elements.clientSecret.value.trim());
+  fd.append("anthropicKey", form.elements.anthropicKey.value.trim());
   fd.append("namePattern", patternInput.value || "{name}-tagged");
   fd.append("runAccessibilityChecker", form.elements.runAccessibilityChecker.checked);
   fd.append("generateReport", form.elements.generateReport.checked);
   fd.append("shiftHeadings", form.elements.shiftHeadings.checked);
   if (form.elements.pageStart.value) fd.append("pageStart", form.elements.pageStart.value);
   if (form.elements.pageEnd.value) fd.append("pageEnd", form.elements.pageEnd.value);
-
-  const outputNames = selectedFiles.map((f) => f.customName || "");
-  fd.append("outputNames", JSON.stringify(outputNames));
-
-  for (const f of selectedFiles) {
-    fd.append("files", f.file, f.file.name);
-  }
+  fd.append("outputNames", JSON.stringify(selectedFiles.map((f) => f.customName || "")));
+  for (const f of selectedFiles) fd.append("files", f.file, f.file.name);
 
   submitBtn.disabled = true;
-  setStatus(`Processing ${selectedFiles.length} file(s)… this can take a minute per PDF.`);
+  setStatus(statusEl, `Tagging ${selectedFiles.length} PDF(s) and drafting alt text — this typically runs ~30–60s per file.`);
 
   try {
-    const res = await fetch("/api/batch", { method: "POST", body: fd });
+    const res = await fetch("/api/analyze", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    session = data;
+    showReview();
+  } catch (err) {
+    setStatus(statusEl, "Failed: " + err.message, "err");
+  } finally {
+    // Wipe credential fields whether or not the call succeeded.
+    form.elements.clientId.value = "";
+    form.elements.clientSecret.value = "";
+    form.elements.anthropicKey.value = "";
+    submitBtn.disabled = false;
+  }
+});
+
+function detectFlag(draft) {
+  if (!draft) return { decorative: false, complex: false, alt: "" };
+  const trimmed = draft.trim();
+  if (/^DECORATIVE\b/i.test(trimmed)) return { decorative: true, complex: false, alt: "" };
+  const complexMatch = trimmed.match(/^COMPLEX:\s*(.*)$/is);
+  if (complexMatch) return { decorative: false, complex: true, alt: complexMatch[1].trim() };
+  return { decorative: false, complex: false, alt: trimmed };
+}
+
+function showReview() {
+  stepSubmit.hidden = true;
+  stepReview.hidden = false;
+  reviewList.innerHTML = "";
+
+  const totalFigs = session.files.reduce((n, f) => n + f.figures.length, 0);
+  reviewSummary.textContent = `${session.files.length} PDF(s), ${totalFigs} figure(s). Edit drafts below; blank alt text is allowed for decorative images.`;
+
+  for (const file of session.files) {
+    const card = document.createElement("section");
+    card.className = "card review-card";
+    const fileHeader = document.createElement("div");
+    fileHeader.className = "file-header";
+    fileHeader.innerHTML = `
+      <h3>${file.originalName} <span class="muted">&rarr; ${file.outputBase}.pdf</span></h3>
+      <div class="muted small">${file.figures.length} figure(s)</div>
+    `;
+    card.appendChild(fileHeader);
+
+    if (file.figures.length === 0) {
+      const none = document.createElement("p");
+      none.className = "muted";
+      none.textContent = "No figures detected in this PDF.";
+      card.appendChild(none);
+    } else {
+      const grid = document.createElement("div");
+      grid.className = "figure-grid";
+      for (const fig of file.figures) {
+        const initial = detectFlag(fig.draftAlt);
+        const row = document.createElement("div");
+        row.className = "figure-row";
+        row.dataset.id = fig.id;
+        row.innerHTML = `
+          <div class="figure-thumb">
+            <img src="${fig.thumbnail}" alt="" />
+            <div class="figure-meta">p.${fig.page ?? "?"}</div>
+          </div>
+          <div class="figure-edit">
+            <textarea class="alt-input" rows="3" placeholder="Alt text">${escapeHTML(initial.alt)}</textarea>
+            <div class="flag-row">
+              <label class="check small"><input type="checkbox" class="dec" ${initial.decorative ? "checked" : ""}/> Decorative (no alt)</label>
+              <label class="check small"><input type="checkbox" class="cpx" ${initial.complex ? "checked" : ""}/> Complex (needs long description)</label>
+              <span class="figure-path muted small">${escapeHTML(fig.path)}</span>
+            </div>
+          </div>
+        `;
+        // disable textarea when decorative
+        const ta = row.querySelector(".alt-input");
+        const dec = row.querySelector(".dec");
+        const cpx = row.querySelector(".cpx");
+        const syncDec = () => {
+          ta.disabled = dec.checked;
+          if (dec.checked) cpx.checked = false;
+        };
+        dec.addEventListener("change", syncDec);
+        syncDec();
+        grid.appendChild(row);
+      }
+      card.appendChild(grid);
+    }
+    reviewList.appendChild(card);
+  }
+}
+
+function escapeHTML(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function collectAltText() {
+  const out = {};
+  reviewList.querySelectorAll(".figure-row").forEach((row) => {
+    const id = row.dataset.id;
+    const dec = row.querySelector(".dec").checked;
+    const cpx = row.querySelector(".cpx").checked;
+    const alt = row.querySelector(".alt-input").value.trim();
+    out[id] = { alt: dec ? "" : alt, decorative: dec, complex: cpx };
+  });
+  return out;
+}
+
+finalizeBtn.addEventListener("click", async () => {
+  finalizeBtn.disabled = true;
+  setStatus(reviewStatus, "Building zip…");
+  try {
+    const res = await fetch("/api/finalize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId, altText: collectAltText() }),
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
@@ -110,13 +222,35 @@ form.addEventListener("submit", async (e) => {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    setStatus("Done. Zip downloaded.", "ok");
+    setStatus(reviewStatus, "Done. Zip downloaded.", "ok");
+    session = null;
+    // Reset back to step 1 after a short pause.
+    setTimeout(() => {
+      stepReview.hidden = true;
+      stepSubmit.hidden = false;
+      selectedFiles = [];
+      renderFileList();
+      setStatus(statusEl, "");
+      setStatus(reviewStatus, "");
+    }, 1500);
   } catch (err) {
-    setStatus("Failed: " + err.message, "err");
+    setStatus(reviewStatus, "Failed: " + err.message, "err");
   } finally {
-    // Wipe credential fields from memory once the request is done.
-    form.elements.clientId.value = "";
-    form.elements.clientSecret.value = "";
-    submitBtn.disabled = false;
+    finalizeBtn.disabled = false;
   }
+});
+
+backBtn.addEventListener("click", async () => {
+  if (!session) return;
+  try {
+    await fetch("/api/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    });
+  } catch {}
+  session = null;
+  stepReview.hidden = true;
+  stepSubmit.hidden = false;
+  setStatus(reviewStatus, "");
 });

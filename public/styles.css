@@ -148,3 +148,104 @@ footer {
   text-align: center;
 }
 footer a { color: var(--muted); }
+
+/* Review step */
+.review-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.review-header h2 { margin: 0 0 4px; font-size: 18px; }
+.review-actions { display: flex; gap: 8px; }
+.review-actions button {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: none;
+  border-radius: 6px;
+  padding: 9px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.review-actions button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+.review-actions button:disabled { opacity: 0.6; cursor: progress; }
+
+.review-card h3 {
+  font-size: 15px;
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+.review-card .file-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.review-card h3 .muted { font-weight: 400; }
+
+.figure-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.figure-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 14px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0f1218;
+}
+.figure-thumb {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.figure-thumb img {
+  max-width: 100%;
+  max-height: 140px;
+  background: #fff;
+  border-radius: 4px;
+  object-fit: contain;
+}
+.figure-meta { font-size: 11px; color: var(--muted); }
+.figure-edit { display: flex; flex-direction: column; gap: 6px; }
+.alt-input {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+}
+.alt-input:disabled { opacity: 0.5; }
+.flag-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+.flag-row .check { margin: 0; }
+.figure-path {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+#review-status { margin-top: 14px; min-height: 22px; font-size: 14px; color: var(--muted); }
+#review-status.ok { color: var(--ok); }
+#review-status.err { color: var(--err); }
