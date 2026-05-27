@@ -5,17 +5,19 @@ const submitBtn = document.getElementById("submit-btn");
 const statusEl = document.getElementById("status");
 const patternInput = document.getElementById("pattern");
 const draftAltToggle = document.getElementById("draft-alt-toggle");
-const anthropicKeyLabel = document.getElementById("anthropic-key-label");
-const anthropicKeyInput = anthropicKeyLabel.querySelector("input");
+const claudeBody = document.getElementById("claude-body");
+const anthropicKeyInput = claudeBody.querySelector('input[name="anthropicKey"]');
 
 function syncDraftAlt() {
   const on = draftAltToggle.checked;
-  anthropicKeyLabel.hidden = !on;
+  claudeBody.hidden = !on;
   anthropicKeyInput.required = on;
   anthropicKeyInput.setAttribute("aria-required", on ? "true" : "false");
+  draftAltToggle.setAttribute("aria-expanded", on ? "true" : "false");
   if (!on) anthropicKeyInput.value = "";
   submitBtn.textContent = on ? "Analyze & draft alt text" : "Analyze (no drafts)";
 }
+draftAltToggle.setAttribute("aria-controls", "claude-body");
 draftAltToggle.addEventListener("change", syncDraftAlt);
 syncDraftAlt();
 

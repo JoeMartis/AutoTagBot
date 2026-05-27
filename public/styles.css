@@ -360,6 +360,18 @@ footer a { color: var(--accent); }
 }
 .link-btn:hover { background: #dbe6fa; }
 
+.collapsible .card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 16px;
+  cursor: pointer;
+}
+.collapsible .card-toggle input { width: 18px; height: 18px; }
+.collapsible .card-body { margin-top: 16px; }
+.collapsible .card-body[hidden] { display: none; }
+
 .sr-only {
   position: absolute;
   width: 1px;
