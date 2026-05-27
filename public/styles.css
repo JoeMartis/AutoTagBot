@@ -317,6 +317,49 @@ footer a { color: var(--accent); }
   font-size: 12px;
 }
 
+.source-tag {
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.suggestion {
+  margin-top: 4px;
+  padding: 8px 12px;
+  background: #eef4ff;
+  border: 1px solid #c8d8f5;
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: baseline;
+}
+.suggestion-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #2b4a8a;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.suggestion-text {
+  flex: 1 1 auto;
+  font-size: 14px;
+  color: var(--text);
+}
+.link-btn {
+  background: transparent;
+  border: none;
+  color: var(--focus);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  text-decoration: underline;
+}
+.link-btn:hover { background: #dbe6fa; }
+
 .sr-only {
   position: absolute;
   width: 1px;

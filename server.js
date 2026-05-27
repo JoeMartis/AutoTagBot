@@ -35,10 +35,11 @@ const CLAUDE_MODEL = "claude-haiku-4-5";
 const CLAUDE_CONCURRENCY = 4;
 const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 const APPLY_ALT_SCRIPT = path.join(__dirname, "scripts", "apply_alt.py");
+const READ_ALT_SCRIPT = path.join(__dirname, "scripts", "read_alt.py");
 
-function runPython(args) {
+function runPython(scriptPath, args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(PYTHON_BIN, [APPLY_ALT_SCRIPT, ...args]);
+    const proc = spawn(PYTHON_BIN, [scriptPath, ...args]);
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (d) => (stdout += d));
@@ -51,7 +52,7 @@ function runPython(args) {
       const err = new Error(
         (parsed && parsed.error) ||
           stderr.trim() ||
-          `apply_alt.py exited with code ${code}`,
+          `${path.basename(scriptPath)} exited with code ${code}`,
       );
       err.code = code;
       err.report = parsed;
@@ -379,6 +380,18 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           warnings.push({ stage: "extract", message: describeError(err) });
         }
 
+        // Pull any existing /Alt from the tagged PDF so the UI can show what's
+        // already there. Order matches the figs[] above (both walk the struct
+        // tree in document order). pikepdf missing here is a soft failure —
+        // we'll surface a warning and continue without existing-alt info.
+        let existingAlts = [];
+        try {
+          const read = await runPython(READ_ALT_SCRIPT, ["--in", taggedPath]);
+          existingAlts = (read && read.alts) || [];
+        } catch (err) {
+          warnings.push({ stage: "read-existing-alt", message: describeError(err) });
+        }
+
         let drafts = [];
         if (options.draftAlt && anthropic && figs.length) {
           stage = "claude";
@@ -394,11 +407,13 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
         for (let f = 0; f < figs.length; f++) {
           const figureId = `${i}-${f}`;
           const thumbnail = await buildThumbnail(figs[f].renditionPath);
+          const existing = existingAlts[f] || {};
           figuresResp.push({
             id: figureId,
             path: figs[f].path,
             page: figs[f].page,
             bbox: figs[f].bbox,
+            existingAlt: (existing.alt || "").trim(),
             draftAlt: drafts[f] || "",
             thumbnail,
           });
@@ -465,7 +480,7 @@ async function applyAltAndCheck(session, file, altById) {
   let rewriteError = null;
   try {
     const candidatePath = path.join(session.workDir, `${file.outputBase}-with-alt.pdf`);
-    rewriteReport = await runPython([
+    rewriteReport = await runPython(APPLY_ALT_SCRIPT, [
       "--in", file.taggedPath,
       "--out", candidatePath,
       "--manifest", manifestPath,

@@ -241,7 +241,18 @@ function showReview() {
       const grid = document.createElement("div");
       grid.className = "figure-grid";
       for (const fig of file.figures) {
-        const initial = detectFlag(fig.draftAlt);
+        const existing = (fig.existingAlt || "").trim();
+        const draftParsed = detectFlag(fig.draftAlt);
+        // Initial textarea value: prefer existing alt; otherwise use Claude's draft.
+        // Flags (decorative/complex) come from the Claude draft only if there's no existing alt.
+        const useExisting = existing.length > 0;
+        const initialAlt = useExisting ? existing : draftParsed.alt;
+        const initialDecorative = !useExisting && draftParsed.decorative;
+        const initialComplex = !useExisting && draftParsed.complex;
+        // Show Claude's suggestion only if it's meaningfully different from existing.
+        const claudeText = draftParsed.alt || (draftParsed.decorative ? "(decorative)" : "");
+        const showSuggestion = useExisting && claudeText && claudeText.trim() !== existing;
+
         const row = document.createElement("div");
         row.className = "figure-row";
         row.dataset.id = fig.id;
@@ -251,12 +262,20 @@ function showReview() {
             <div class="figure-meta">p.${fig.page ?? "?"}</div>
           </div>
           <div class="figure-edit">
-            <textarea class="alt-input" rows="3" placeholder="Alt text">${escapeHTML(initial.alt)}</textarea>
+            ${useExisting ? `<div class="source-tag muted small">Existing alt from PDF</div>` : ""}
+            <textarea class="alt-input" rows="3" placeholder="Alt text" aria-label="Alt text for figure on page ${fig.page ?? "?"}">${escapeHTML(initialAlt)}</textarea>
             <div class="flag-row">
-              <label class="check small"><input type="checkbox" class="dec" ${initial.decorative ? "checked" : ""}/> Decorative (no alt)</label>
-              <label class="check small"><input type="checkbox" class="cpx" ${initial.complex ? "checked" : ""}/> Complex (needs long description)</label>
+              <label class="check small"><input type="checkbox" class="dec" ${initialDecorative ? "checked" : ""}/> Decorative (no alt)</label>
+              <label class="check small"><input type="checkbox" class="cpx" ${initialComplex ? "checked" : ""}/> Complex (needs long description)</label>
               <span class="figure-path muted small">${escapeHTML(fig.path)}</span>
             </div>
+            ${showSuggestion ? `
+              <div class="suggestion">
+                <div class="suggestion-label">Claude suggests:</div>
+                <div class="suggestion-text">${escapeHTML(claudeText)}</div>
+                <button type="button" class="link-btn use-suggestion">Use this</button>
+              </div>
+            ` : ""}
           </div>
         `;
         // disable textarea when decorative
@@ -269,6 +288,23 @@ function showReview() {
         };
         dec.addEventListener("change", syncDec);
         syncDec();
+
+        const useBtn = row.querySelector(".use-suggestion");
+        if (useBtn) {
+          useBtn.addEventListener("click", () => {
+            if (draftParsed.decorative) {
+              dec.checked = true;
+              cpx.checked = false;
+              syncDec();
+            } else {
+              dec.checked = false;
+              cpx.checked = draftParsed.complex;
+              syncDec();
+              ta.value = draftParsed.alt;
+            }
+            ta.focus();
+          });
+        }
         grid.appendChild(row);
       }
       card.appendChild(grid);
