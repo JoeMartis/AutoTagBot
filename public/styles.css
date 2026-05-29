@@ -384,6 +384,31 @@ footer a { color: var(--accent); }
 .collapsible .card-body { margin-top: 16px; }
 .collapsible .card-body[hidden] { display: none; }
 
+.mode-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+.mode-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  padding: 9px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.mode-tab:hover { color: var(--text); }
+.mode-tab.active {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

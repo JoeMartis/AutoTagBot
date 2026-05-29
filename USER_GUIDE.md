@@ -121,6 +121,32 @@ text should appear next to each `<Figure>`.
 
 ---
 
+## 5b. Splitting the workflow (session packages)
+
+If you have credentials and a collaborator doesn't, you can do the API-heavy
+half and hand off the review.
+
+**You (with keys):**
+1. Run **Analyze** as normal — Auto-Tag, Extract, optional Claude drafts.
+2. On the review screen, click **Export session package**. You get
+   `autotagbot-session.zip`.
+3. Hand the zip to your collaborator (email, drive, Slack, whatever).
+
+**Your collaborator (no keys):**
+1. On the upload screen, click the **Import session package** tab.
+2. Drop the `.zip` in.
+3. The review screen opens exactly as if they'd run Analyze themselves —
+   thumbnails, draft alt, decorative/complex flags, everything.
+4. They edit, click **Apply alt & export zip**, and get the finished PDFs
+   with alt text baked in.
+
+The pikepdf write-back doesn't need any API keys, so the import flow works
+fully offline. What's lost: the Adobe Accessibility Checker re-run (skipped
+on imported sessions — your collaborator can verify alt text by opening the
+final PDF's tag tree in Acrobat instead).
+
+---
+
 ## 6. Tips and gotchas
 
 - **Decorative is best-effort.** The empty `/Alt` we write satisfies most

@@ -4,6 +4,75 @@ const form = document.getElementById("batch-form");
 const submitBtn = document.getElementById("submit-btn");
 const statusEl = document.getElementById("status");
 const patternInput = document.getElementById("pattern");
+
+// Mode toggle between "new batch" (Adobe + optional Claude) and "import package".
+const modeNewBtn = document.getElementById("mode-new");
+const modeImportBtn = document.getElementById("mode-import");
+const importForm = document.getElementById("import-form");
+const packageInput = document.getElementById("package-file");
+const packageDrop = document.getElementById("package-drop");
+const packageNameEl = document.getElementById("package-name");
+const importBtn = document.getElementById("import-btn");
+const importStatus = document.getElementById("import-status");
+
+function setMode(mode) {
+  const isNew = mode === "new";
+  form.hidden = !isNew;
+  importForm.hidden = isNew;
+  modeNewBtn.classList.toggle("active", isNew);
+  modeImportBtn.classList.toggle("active", !isNew);
+  modeNewBtn.setAttribute("aria-selected", isNew ? "true" : "false");
+  modeImportBtn.setAttribute("aria-selected", !isNew ? "true" : "false");
+}
+modeNewBtn.addEventListener("click", () => setMode("new"));
+modeImportBtn.addEventListener("click", () => setMode("import"));
+
+let selectedPackage = null;
+packageInput.addEventListener("change", (e) => {
+  selectedPackage = e.target.files[0] || null;
+  packageNameEl.style.display = selectedPackage ? "block" : "none";
+  packageNameEl.textContent = selectedPackage ? `Selected: ${selectedPackage.name}` : "";
+});
+// Drag-drop for the package drop zone too.
+["dragenter", "dragover"].forEach((ev) => {
+  packageDrop.addEventListener(ev, (e) => { e.preventDefault(); packageDrop.classList.add("dragover"); });
+});
+["dragleave", "dragend"].forEach((ev) => {
+  packageDrop.addEventListener(ev, (e) => { e.preventDefault(); packageDrop.classList.remove("dragover"); });
+});
+packageDrop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  packageDrop.classList.remove("dragover");
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f && /\.zip$/i.test(f.name)) {
+    selectedPackage = f;
+    packageNameEl.style.display = "block";
+    packageNameEl.textContent = `Selected: ${f.name}`;
+  }
+});
+
+importForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!selectedPackage) {
+    setStatus(importStatus, "Choose a session package first.", "err");
+    return;
+  }
+  const fd = new FormData();
+  fd.append("package", selectedPackage, selectedPackage.name);
+  importBtn.disabled = true;
+  setStatus(importStatus, "Importing session package…");
+  try {
+    const res = await fetch("/api/import-package", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    session = data;
+    showReview();
+  } catch (err) {
+    setStatus(importStatus, "Failed: " + err.message, "err");
+  } finally {
+    importBtn.disabled = false;
+  }
+});
 const draftAltToggle = document.getElementById("draft-alt-toggle");
 const claudeBody = document.getElementById("claude-body");
 const anthropicKeyInput = claudeBody.querySelector('input[name="anthropicKey"]');
@@ -375,6 +444,38 @@ finalizeBtn.addEventListener("click", async () => {
     setStatus(reviewStatus, "Failed: " + err.message, "err");
   } finally {
     finalizeBtn.disabled = false;
+  }
+});
+
+const exportPkgBtn = document.getElementById("export-pkg-btn");
+exportPkgBtn.addEventListener("click", async () => {
+  if (!session) return;
+  exportPkgBtn.disabled = true;
+  setStatus(reviewStatus, "Building session package…");
+  try {
+    const res = await fetch("/api/export-package", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "autotagbot-session.zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setStatus(reviewStatus, "Session package downloaded. The session is still active — finalize or cancel as usual.", "ok");
+  } catch (err) {
+    setStatus(reviewStatus, "Export failed: " + err.message, "err");
+  } finally {
+    exportPkgBtn.disabled = false;
   }
 });
 

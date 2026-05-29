@@ -17,6 +17,30 @@
       <!-- STEP 1: submit -->
       <section id="step-submit" aria-labelledby="step-submit-heading">
         <h2 id="step-submit-heading" class="sr-only">Submit batch</h2>
+
+        <div class="mode-tabs" role="tablist" aria-label="Batch source">
+          <button type="button" id="mode-new" class="mode-tab active" role="tab" aria-selected="true" aria-controls="batch-form">New batch</button>
+          <button type="button" id="mode-import" class="mode-tab" role="tab" aria-selected="false" aria-controls="import-form">Import session package</button>
+        </div>
+
+        <form id="import-form" hidden novalidate>
+          <section class="card">
+            <h2>Import a session package</h2>
+            <p class="hint">
+              Drop a <code>.zip</code> exported from another batch. No Adobe or Anthropic
+              credentials needed — you'll review and apply alt text, then download the
+              finished PDFs.
+            </p>
+            <label class="filedrop" for="package-file" id="package-drop">
+              <input type="file" id="package-file" name="package" accept=".zip,application/zip" />
+              <span>Drop session package (.zip) here or click to choose</span>
+            </label>
+            <div id="package-name" class="hint" style="display:none;"></div>
+          </section>
+          <button id="import-btn" type="submit">Import package</button>
+          <div id="import-status" role="status" aria-live="polite"></div>
+        </form>
+
         <form id="batch-form" novalidate>
           <section class="card" aria-labelledby="creds-heading">
             <h2 id="creds-heading">1. Credentials</h2>
@@ -111,6 +135,7 @@
           </div>
           <div class="review-actions">
             <button id="back-btn" type="button" class="ghost">Cancel</button>
+            <button id="export-pkg-btn" type="button" class="ghost">Export session package</button>
             <button id="finalize-btn" type="button">Apply alt &amp; export zip</button>
           </div>
         </div>

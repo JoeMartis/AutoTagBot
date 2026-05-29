@@ -362,6 +362,7 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
       options,
       files: [],
       credentials: { clientId, clientSecret },
+      imported: false,
     };
     sessionRef = session;
     const errors = [];
@@ -463,7 +464,14 @@ app.post("/api/analyze", upload.array("files"), async (req, res) => {
           originalName: file.originalname,
           taggedPath,
           taggingReportPath,
-          figures: figs.map((f, idx) => ({ ...f, id: `${i}-${idx}` })),
+          // Persist what the UI showed so the session can be exported as a
+          // standalone package and re-imported by someone without credentials.
+          figures: figs.map((f, idx) => ({
+            ...f,
+            id: `${i}-${idx}`,
+            existingAlt: ((existingAlts[idx] || {}).alt || "").trim(),
+            draftAlt: drafts[idx] || "",
+          })),
         });
 
         responseFiles.push({
@@ -543,7 +551,10 @@ async function applyAltAndCheck(session, file, altById) {
   let checkerPdfPath = null;
   let checkerReportPath = null;
   let checkerError = null;
-  if (session.options.runAccessibilityChecker) {
+  // Skip the checker entirely for imported sessions — they have no Adobe
+  // credentials by design. Person A can run the checker post-finalize on
+  // their own side if they need the report.
+  if (session.options.runAccessibilityChecker && !session.imported && session.credentials) {
     try {
       const credentials = new ServicePrincipalCredentials(session.credentials);
       const pdfServices = new PDFServices({ credentials });
@@ -723,6 +734,238 @@ app.post("/api/finalize", async (req, res) => {
     if (session) session.credentials = null;
     sessions.delete(sessionId);
     fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+const PACKAGE_VERSION = "1";
+const PACKAGE_MAX_BYTES = 500 * 1024 * 1024;
+
+const uploadPackage = multer({
+  storage: multer.diskStorage({
+    destination: async (_req, _file, cb) => {
+      const dir = path.join(os.tmpdir(), "autotagbot-pkg-" + crypto.randomBytes(6).toString("hex"));
+      await fsp.mkdir(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (_req, _file, cb) => {
+      cb(null, "package.zip");
+    },
+  }),
+  limits: { fileSize: PACKAGE_MAX_BYTES, files: 1 },
+});
+
+// Build a portable session zip: tagged PDFs + figure renditions + a
+// manifest of per-file metadata, existing alts, and Claude drafts. The
+// import endpoint reconstructs the same session state from this zip with
+// no Adobe credentials needed.
+async function buildSessionPackage(session, zipPath) {
+  const manifest = {
+    version: PACKAGE_VERSION,
+    createdAt: new Date().toISOString(),
+    options: { ...session.options, runAccessibilityChecker: false },
+    files: [],
+  };
+
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    let settled = false;
+    const done = (err) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err); else resolve();
+    };
+    archive.on("warning", (err) => { if (err.code !== "ENOENT") done(err); });
+    archive.on("error", done);
+    output.on("error", done);
+    output.on("close", () => done(null));
+    archive.pipe(output);
+
+    session.files.forEach((file, idx) => {
+      const fileEntry = {
+        originalName: file.originalName,
+        outputBase: file.outputBase,
+        taggedPdf: `files/${idx}/tagged.pdf`,
+        taggingReport: null,
+        figures: [],
+      };
+      archive.file(file.taggedPath, { name: fileEntry.taggedPdf });
+      if (file.taggingReportPath) {
+        fileEntry.taggingReport = `files/${idx}/tagging-report.xlsx`;
+        archive.file(file.taggingReportPath, { name: fileEntry.taggingReport });
+      }
+      file.figures.forEach((fig, fIdx) => {
+        let renditionRelpath = null;
+        if (fig.renditionPath && fs.existsSync(fig.renditionPath)) {
+          const ext = path.extname(fig.renditionPath).toLowerCase() || ".png";
+          renditionRelpath = `files/${idx}/figures/${fIdx}${ext}`;
+          archive.file(fig.renditionPath, { name: renditionRelpath });
+        }
+        fileEntry.figures.push({
+          id: fig.id,
+          path: fig.path,
+          page: fig.page,
+          bbox: fig.bbox,
+          renditionRelpath,
+          existingAlt: fig.existingAlt || "",
+          draftAlt: fig.draftAlt || "",
+        });
+      });
+      manifest.files.push(fileEntry);
+    });
+
+    archive.append(JSON.stringify(manifest, null, 2), { name: "manifest.json" });
+    archive.finalize().catch(done);
+  });
+}
+
+app.post("/api/export-package", async (req, res) => {
+  const { sessionId } = req.body || {};
+  if (!sessionId || !sessions.has(sessionId)) {
+    return res.status(404).json({ error: "Session not found or expired." });
+  }
+  const session = sessions.get(sessionId);
+  const zipPath = path.join(session.workDir, "autotagbot-session.zip");
+  try {
+    await buildSessionPackage(session, zipPath);
+  } catch (err) {
+    console.error("package build failed:", err);
+    return res.status(500).json({ error: "Failed to build session package.", detail: describeError(err) });
+  }
+  const stat = await fsp.stat(zipPath);
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="autotagbot-session.zip"`);
+  res.setHeader("Content-Length", stat.size);
+  await new Promise((resolve, reject) => {
+    const rs = fs.createReadStream(zipPath);
+    rs.on("error", reject);
+    res.on("close", resolve);
+    res.on("error", reject);
+    rs.pipe(res);
+  });
+  // Don't delete the zip from workDir — session may still be finalized normally.
+  fsp.unlink(zipPath).catch(() => {});
+});
+
+// Resolve a relative path inside extractDir defensively (zip-slip guard).
+function safeResolve(extractDir, relpath) {
+  if (!relpath || typeof relpath !== "string") return null;
+  const full = path.resolve(extractDir, relpath);
+  const root = path.resolve(extractDir) + path.sep;
+  if (!full.startsWith(root) && full !== path.resolve(extractDir)) return null;
+  return fs.existsSync(full) ? full : null;
+}
+
+app.post("/api/import-package", uploadPackage.single("package"), async (req, res) => {
+  let workDir = null;
+  let stored = false;
+  try {
+    if (!req.file) return res.status(400).json({ error: "No package uploaded." });
+
+    const sessionId = crypto.randomBytes(12).toString("hex");
+    workDir = path.join(os.tmpdir(), "autotagbot-sess-" + sessionId);
+    await fsp.mkdir(workDir, { recursive: true });
+
+    // adm-zip throws on malformed archives; catch and surface a clean 400.
+    let zip;
+    try {
+      zip = new AdmZip(req.file.path);
+    } catch (err) {
+      return res.status(400).json({ error: "Invalid zip file.", detail: describeError(err) });
+    }
+
+    // Extract entry-by-entry with explicit path validation so a poisoned
+    // archive can't write outside workDir (zip-slip defense in depth).
+    for (const entry of zip.getEntries()) {
+      if (entry.isDirectory) continue;
+      const dest = path.resolve(workDir, entry.entryName);
+      const root = path.resolve(workDir) + path.sep;
+      if (!dest.startsWith(root)) {
+        return res.status(400).json({ error: `Invalid path in package: ${entry.entryName}` });
+      }
+      await fsp.mkdir(path.dirname(dest), { recursive: true });
+      await fsp.writeFile(dest, entry.getData());
+    }
+
+    const manifestPath = path.join(workDir, "manifest.json");
+    if (!fs.existsSync(manifestPath)) {
+      return res.status(400).json({ error: "Package is missing manifest.json." });
+    }
+    const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+    if (!manifest.version || !Array.isArray(manifest.files)) {
+      return res.status(400).json({ error: "Manifest is malformed." });
+    }
+    if (manifest.version !== PACKAGE_VERSION) {
+      return res.status(400).json({ error: `Unsupported package version: ${manifest.version}` });
+    }
+
+    const session = {
+      createdAt: Date.now(),
+      workDir,
+      options: { ...(manifest.options || {}), runAccessibilityChecker: false },
+      files: [],
+      credentials: null,
+      imported: true,
+    };
+
+    const responseFiles = [];
+    for (let i = 0; i < manifest.files.length; i++) {
+      const fEntry = manifest.files[i];
+      const taggedPath = safeResolve(workDir, fEntry.taggedPdf);
+      if (!taggedPath) {
+        return res.status(400).json({ error: `Tagged PDF missing for file ${i}.` });
+      }
+      const taggingReportPath = fEntry.taggingReport ? safeResolve(workDir, fEntry.taggingReport) : null;
+
+      const figures = [];
+      const figuresResp = [];
+      for (const fig of fEntry.figures || []) {
+        const renditionPath = fig.renditionRelpath ? safeResolve(workDir, fig.renditionRelpath) : null;
+        figures.push({
+          id: fig.id,
+          path: fig.path,
+          page: fig.page,
+          bbox: fig.bbox,
+          renditionPath,
+          existingAlt: fig.existingAlt || "",
+          draftAlt: fig.draftAlt || "",
+        });
+        figuresResp.push({
+          id: fig.id,
+          path: fig.path,
+          page: fig.page,
+          bbox: fig.bbox,
+          existingAlt: fig.existingAlt || "",
+          draftAlt: fig.draftAlt || "",
+          thumbnail: await buildThumbnail(renditionPath),
+        });
+      }
+
+      session.files.push({
+        outputBase: fEntry.outputBase,
+        originalName: fEntry.originalName,
+        taggedPath,
+        taggingReportPath,
+        figures,
+      });
+      responseFiles.push({
+        fileIndex: i,
+        originalName: fEntry.originalName,
+        outputBase: fEntry.outputBase,
+        figures: figuresResp,
+        warnings: [],
+      });
+    }
+
+    sessions.set(sessionId, session);
+    stored = true;
+    res.json({ sessionId, files: responseFiles, errors: [], imported: true });
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ error: "Import failed.", detail: describeError(err) });
+  } finally {
+    if (req.file) fsp.rm(path.dirname(req.file.path), { recursive: true, force: true }).catch(() => {});
+    if (workDir && !stored) fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
